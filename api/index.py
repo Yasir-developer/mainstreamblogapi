@@ -5,6 +5,8 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import google.generativeai as genai
 from dotenv import load_dotenv
+import requests
+from bs4 import BeautifulSoup
 
 load_dotenv()
 
@@ -28,6 +30,9 @@ class GenerateResponse(BaseModel):
     meta_title: str
     meta_description: str
     tags: List[str]
+
+class ParaphraseRequest(BaseModel):
+    url: str
 
 app = FastAPI()
 
@@ -135,6 +140,113 @@ def generate_blog_post(req: GenerateRequest):
         content=content_part.replace('\n',''),
         meta_title=meta_title,
         meta_description=meta_description,
+        tags=tags
+    )
+
+@app.post("/paraphrase", response_model=GenerateResponse)
+def paraphrase_blog(req: ParaphraseRequest):
+    """
+    Fetches a blog from the given URL, paraphrases it, and returns the result.
+    Filters out affiliate links and advertisements.
+    """
+    try:
+        response = requests.get(req.url, timeout=10)
+        response.raise_for_status()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to fetch URL: {e}")
+
+    soup = BeautifulSoup(response.text, "html.parser")
+
+    # Remove affiliate links (example: links containing 'aff', 'ref', or known affiliate domains)
+    for a in soup.find_all("a", href=True):
+        href = a['href'].lower()
+        if any(x in href for x in ["aff", "ref", "amazon", "clickbank", "shareasale", "ad.doubleclick"]):
+            a.decompose()
+
+    # Remove common ad elements
+    for ad_class in ["ad", "ads", "advertisement", "sponsored"]:
+        for tag in soup.find_all(class_=ad_class):
+            tag.decompose()
+
+    # Extract main content
+    paragraphs = soup.find_all("p")
+    content_text = "\n".join([p.get_text() for p in paragraphs if p.get_text().strip()])
+
+    if not content_text:
+        raise HTTPException(status_code=400, detail="Could not extract blog content.")
+
+    # Extract meta title and description
+    meta_title = soup.title.string.strip() if soup.title else "Paraphrased Blog"
+    meta_description = ""
+    meta_tag = soup.find("meta", attrs={"name": "description"})
+    if meta_tag and meta_tag.get("content"):
+        meta_description = meta_tag["content"].strip()
+    else:
+        meta_description = content_text[:160]
+
+    # Paraphrase using Gemini, request ~2000 words
+    prompt = (
+        "Paraphrase the following blog content in a natural, human-like tone. "
+        "Preserve the structure and meaning, but use different wording. "
+        "Ignore any affiliate links or advertisements. "
+        "Format the output with HTML headings and paragraphs. "
+        "The paraphrased blog post should be approximately 2000 words. "
+        "After the blog post content, provide meta information in the following format:\n\n"
+        "**Meta Information:**\n\n"
+        f"**Meta Title:** {meta_title}\n"
+        f"**Meta Description:** {meta_description}\n"
+        "**Tags:** (suggest 3-5 relevant tags)\n\n"
+        "Content to paraphrase:\n"
+        f"{content_text}"
+    )
+
+    generation_config = {
+        "temperature": 0.7,
+        "top_p": 0.95,
+        "top_k": 40,
+        "max_output_tokens": 8192,
+        "response_mime_type": "text/plain",
+    }
+
+    model = genai.GenerativeModel(
+        model_name="gemini-1.5-flash",
+        generation_config=generation_config,
+    )
+
+    chat_session = model.start_chat(history=[])
+    ai_response = chat_session.send_message(prompt)
+    generated_text = ai_response.text.strip()
+
+    # Parse the response as before
+    if "**Meta Information:**" in generated_text:
+        parts = generated_text.split("**Meta Information:**")
+        content_part = parts[0].strip()
+        meta_part = parts[1].strip()
+    else:
+        raise HTTPException(status_code=500, detail="No meta information found.")
+
+    meta_title_out = meta_title
+    meta_description_out = meta_description
+    tags = []
+
+    meta_lines = meta_part.split("\n")
+    for line in meta_lines:
+        line_stripped = line.strip()
+        if line_stripped.upper().startswith("**META TITLE:**"):
+            meta_title_out = line_stripped.split("**Meta Title:**", 1)[1].strip()
+        elif line_stripped.upper().startswith("**META DESCRIPTION:**"):
+            meta_description_out = line_stripped.split("**Meta Description:**", 1)[1].strip()
+        elif line_stripped.upper().startswith("**TAGS:**"):
+            raw_tags = line_stripped.split("**Tags:**", 1)[1].strip()
+            tags = [t.strip() for t in raw_tags.split(",") if t.strip()]
+
+    if not content_part:
+        raise HTTPException(status_code=500, detail="No content generated.")
+
+    return GenerateResponse(
+        content=content_part.replace('\n',''),
+        meta_title=meta_title_out,
+        meta_description=meta_description_out,
         tags=tags
     )
 
